@@ -4,6 +4,7 @@ from pyspark.sql.functions import (
     window, count, approx_count_distinct, to_date
 )
 from pyspark.sql.types import StructType, StructField, StringType, TimestampType
+import os
 
 # --------------------------------------------------
 # Spark Session
@@ -14,6 +15,13 @@ spark = SparkSession.builder \
     .getOrCreate()
 
 spark.sparkContext.setLogLevel('WARN')
+
+# --------------------------------------------------
+# Environment Variables
+# --------------------------------------------------
+DB_URL = os.getenv('DB_URL')
+DB_USER = os.getenv('DB_USER')
+DB_PASSWORD = os.getenv('DB_PASSWORD')
 
 # --------------------------------------------------
 # Kafka Source
@@ -36,7 +44,7 @@ event_schema = StructType([
 ])
 
 # --------------------------------------------------
-# Parse JSON and Apply Schema
+# Parse JSON and Apply Schema + Watermark
 # --------------------------------------------------
 events_df = kafka_df.select(
     from_json(col('value').cast('string'), event_schema).alias('data')
@@ -48,7 +56,7 @@ events_df = kafka_df.select(
 ).withWatermark('event_time', '2 minutes')
 
 # --------------------------------------------------
-# Write Raw Events to Data Lake (Parquet)
+# RAW EVENTS ? DATA LAKE
 # --------------------------------------------------
 raw_query = events_df \
     .withColumn('event_date', to_date(col('event_time'))) \
@@ -60,4 +68,40 @@ raw_query = events_df \
     .outputMode('append') \
     .start()
 
-raw_query.awaitTermination()
+# --------------------------------------------------
+# PAGE VIEW COUNTS (1-Min Tumbling Window)
+# --------------------------------------------------
+page_views = events_df \
+    .filter(col('event_type') == 'page_view') \
+    .groupBy(
+        window(col('event_time'), '1 minute'),
+        col('page_url')
+    ) \
+    .count()
+
+# --------------------------------------------------
+# Write Page Views to PostgreSQL (UPSERT)
+# --------------------------------------------------
+def write_page_views_to_db(batch_df, batch_id):
+    batch_df.select(
+        col('window.start').alias('window_start'),
+        col('window.end').alias('window_end'),
+        col('page_url'),
+        col('count').alias('view_count')
+    ).write \
+        .format('jdbc') \
+        .option('url', DB_URL) \
+        .option('dbtable', 'page_view_counts') \
+        .option('user', DB_USER) \
+        .option('password', DB_PASSWORD) \
+        .option('driver', 'org.postgresql.Driver') \
+        .mode('append') \
+        .save()
+
+page_view_query = page_views.writeStream \
+    .outputMode('update') \
+    .foreachBatch(write_page_views_to_db) \
+    .option('checkpointLocation', '/opt/spark/data/lake/_checkpoints/page_views') \
+    .start()
+
+spark.streams.awaitAnyTermination()
