@@ -3,8 +3,13 @@ from pyspark.sql.functions import (
     from_json, col, to_timestamp, window,
     approx_count_distinct, to_date
 )
-from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql.types import (
+    StructType, StructField, StringType,
+    TimestampType, LongType
+)
+from pyspark.sql.streaming import GroupState, GroupStateTimeout
 import os
+from datetime import datetime
 
 # --------------------------------------------------
 # Spark Session
@@ -56,7 +61,7 @@ events_df = kafka_df.select(
 ).withWatermark('event_time', '2 minutes')
 
 # --------------------------------------------------
-# RAW  DATA LAKE
+# RAW EVENTS ? DATA LAKE
 # --------------------------------------------------
 events_df \
     .withColumn('event_date', to_date(col('event_time'))) \
@@ -69,66 +74,71 @@ events_df \
     .start()
 
 # --------------------------------------------------
-# PAGE VIEW COUNTS
+# SESSION STATE FUNCTION
 # --------------------------------------------------
-page_views = events_df \
-    .filter(col('event_type') == 'page_view') \
-    .groupBy(
-        window(col('event_time'), '1 minute'),
-        col('page_url')
-    ) \
-    .count()
+session_schema = StructType([
+    StructField('user_id', StringType()),
+    StructField('session_start_time', TimestampType()),
+    StructField('session_end_time', TimestampType()),
+    StructField('session_duration_seconds', LongType())
+])
 
-def write_page_views(batch_df, batch_id):
-    batch_df.select(
-        col('window.start').alias('window_start'),
-        col('window.end').alias('window_end'),
-        col('page_url'),
-        col('count').alias('view_count')
-    ).write \
+def session_state_func(user_id, rows, state: GroupState):
+    output = []
+
+    if state.hasTimedOut:
+        start_time = state.get()
+        end_time = datetime.utcnow()
+        duration = int((end_time - start_time).total_seconds())
+
+        output.append((user_id, start_time, end_time, duration))
+        state.remove()
+        return output
+
+    for row in rows:
+        if row.event_type == 'session_start':
+            state.update(row.event_time)
+            state.setTimeoutDuration(15 * 60 * 1000)
+
+        elif row.event_type == 'session_end' and state.exists:
+            start_time = state.get()
+            end_time = row.event_time
+            duration = int((end_time - start_time).total_seconds())
+
+            output.append((user_id, start_time, end_time, duration))
+            state.remove()
+
+    return output
+
+# --------------------------------------------------
+# APPLY STATEFUL SESSION LOGIC
+# --------------------------------------------------
+sessions_df = events_df \
+    .filter(col('event_type').isin('session_start', 'session_end')) \
+    .groupByKey(lambda r: r.user_id) \
+    .flatMapGroupsWithState(
+        outputMode='append',
+        updateFunction=session_state_func,
+        stateTimeoutDuration='15 minutes'
+    )
+
+# --------------------------------------------------
+# WRITE SESSIONS TO POSTGRES
+# --------------------------------------------------
+def write_sessions(batch_df, batch_id):
+    batch_df.write \
         .format('jdbc') \
         .option('url', DB_URL) \
-        .option('dbtable', 'page_view_counts') \
+        .option('dbtable', 'user_sessions') \
         .option('user', DB_USER) \
         .option('password', DB_PASSWORD) \
         .option('driver', 'org.postgresql.Driver') \
         .mode('append') \
         .save()
 
-page_views.writeStream \
-    .outputMode('update') \
-    .foreachBatch(write_page_views) \
-    .option('checkpointLocation', '/opt/spark/data/lake/_checkpoints/page_views') \
-    .start()
-
-# --------------------------------------------------
-# ACTIVE USERS (5-MIN SLIDING WINDOW)
-# --------------------------------------------------
-active_users = events_df.groupBy(
-    window(col('event_time'), '5 minutes', '1 minute')
-).agg(
-    approx_count_distinct('user_id').alias('active_user_count')
-)
-
-def write_active_users(batch_df, batch_id):
-    batch_df.select(
-        col('window.start').alias('window_start'),
-        col('window.end').alias('window_end'),
-        col('active_user_count')
-    ).write \
-        .format('jdbc') \
-        .option('url', DB_URL) \
-        .option('dbtable', 'active_users') \
-        .option('user', DB_USER) \
-        .option('password', DB_PASSWORD) \
-        .option('driver', 'org.postgresql.Driver') \
-        .mode('append') \
-        .save()
-
-active_users.writeStream \
-    .outputMode('update') \
-    .foreachBatch(write_active_users) \
-    .option('checkpointLocation', '/opt/spark/data/lake/_checkpoints/active_users') \
+sessions_df.writeStream \
+    .foreachBatch(write_sessions) \
+    .option('checkpointLocation', '/opt/spark/data/lake/_checkpoints/sessions') \
     .start()
 
 spark.streams.awaitAnyTermination()
