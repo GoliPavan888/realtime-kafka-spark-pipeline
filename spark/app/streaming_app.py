@@ -1,4 +1,3 @@
-Set-Content spark\app\streaming_app.py @"
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     from_json, col, to_timestamp, current_timestamp,
@@ -62,4 +61,3 @@ raw_query = events_df \
     .start()
 
 raw_query.awaitTermination()
-"@
