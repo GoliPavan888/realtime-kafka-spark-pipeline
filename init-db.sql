@@ -1,4 +1,3 @@
-Set-Content init-db.sql @"
 CREATE TABLE page_view_counts (
     window_start TIMESTAMP NOT NULL,
     window_end TIMESTAMP NOT NULL,
@@ -20,4 +19,3 @@ CREATE TABLE user_sessions (
     session_end_time TIMESTAMP,
     session_duration_seconds BIGINT
 );
-"@
