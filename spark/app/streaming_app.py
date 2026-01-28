@@ -1,9 +1,9 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    from_json, col, to_timestamp, current_timestamp,
-    window, count, approx_count_distinct, to_date
+    from_json, col, to_timestamp, window,
+    approx_count_distinct, to_date
 )
-from pyspark.sql.types import StructType, StructField, StringType, TimestampType
+from pyspark.sql.types import StructType, StructField, StringType
 import os
 
 # --------------------------------------------------
@@ -34,7 +34,7 @@ kafka_df = spark.readStream \
     .load()
 
 # --------------------------------------------------
-# Schema Definition
+# Schema
 # --------------------------------------------------
 event_schema = StructType([
     StructField('event_time', StringType(), True),
@@ -44,7 +44,7 @@ event_schema = StructType([
 ])
 
 # --------------------------------------------------
-# Parse JSON and Apply Schema + Watermark
+# Parse + Watermark
 # --------------------------------------------------
 events_df = kafka_df.select(
     from_json(col('value').cast('string'), event_schema).alias('data')
@@ -56,9 +56,9 @@ events_df = kafka_df.select(
 ).withWatermark('event_time', '2 minutes')
 
 # --------------------------------------------------
-# RAW EVENTS ? DATA LAKE
+# RAW  DATA LAKE
 # --------------------------------------------------
-raw_query = events_df \
+events_df \
     .withColumn('event_date', to_date(col('event_time'))) \
     .writeStream \
     .format('parquet') \
@@ -69,7 +69,7 @@ raw_query = events_df \
     .start()
 
 # --------------------------------------------------
-# PAGE VIEW COUNTS (1-Min Tumbling Window)
+# PAGE VIEW COUNTS
 # --------------------------------------------------
 page_views = events_df \
     .filter(col('event_type') == 'page_view') \
@@ -79,10 +79,7 @@ page_views = events_df \
     ) \
     .count()
 
-# --------------------------------------------------
-# Write Page Views to PostgreSQL (UPSERT)
-# --------------------------------------------------
-def write_page_views_to_db(batch_df, batch_id):
+def write_page_views(batch_df, batch_id):
     batch_df.select(
         col('window.start').alias('window_start'),
         col('window.end').alias('window_end'),
@@ -98,10 +95,40 @@ def write_page_views_to_db(batch_df, batch_id):
         .mode('append') \
         .save()
 
-page_view_query = page_views.writeStream \
+page_views.writeStream \
     .outputMode('update') \
-    .foreachBatch(write_page_views_to_db) \
+    .foreachBatch(write_page_views) \
     .option('checkpointLocation', '/opt/spark/data/lake/_checkpoints/page_views') \
+    .start()
+
+# --------------------------------------------------
+# ACTIVE USERS (5-MIN SLIDING WINDOW)
+# --------------------------------------------------
+active_users = events_df.groupBy(
+    window(col('event_time'), '5 minutes', '1 minute')
+).agg(
+    approx_count_distinct('user_id').alias('active_user_count')
+)
+
+def write_active_users(batch_df, batch_id):
+    batch_df.select(
+        col('window.start').alias('window_start'),
+        col('window.end').alias('window_end'),
+        col('active_user_count')
+    ).write \
+        .format('jdbc') \
+        .option('url', DB_URL) \
+        .option('dbtable', 'active_users') \
+        .option('user', DB_USER) \
+        .option('password', DB_PASSWORD) \
+        .option('driver', 'org.postgresql.Driver') \
+        .mode('append') \
+        .save()
+
+active_users.writeStream \
+    .outputMode('update') \
+    .foreachBatch(write_active_users) \
+    .option('checkpointLocation', '/opt/spark/data/lake/_checkpoints/active_users') \
     .start()
 
 spark.streams.awaitAnyTermination()
