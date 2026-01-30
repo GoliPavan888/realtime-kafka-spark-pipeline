@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Spark
+checkpoint/
+checkpoints/
+tmp/
+*.parquet
+
+# Kafka
+kafka-logs/
+zookeeper-data/
+
+# Docker
+data/
+volumes/
+
+# IDE
+.vscode/
+.idea/
